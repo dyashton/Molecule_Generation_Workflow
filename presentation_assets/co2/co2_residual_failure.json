@@ -1,0 +1,18 @@
+{
+  "role": "residual_failure",
+  "run": "20260731_120052_co2_full_z_uncapped",
+  "snapshot": "ep990.csv",
+  "episode": 990,
+  "SMILES": "CCCN1CCC(O)C(O)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C1CO",
+  "canonical_SMILES": "CCCN1CCC(O)C(O)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C(N)C1CO",
+  "policy": 5.207942249835105,
+  "raw_total": 5.207942249835105,
+  "raw_physchem": 6.429701292304397,
+  "gate_ok": "True",
+  "MW": 624.9,
+  "LogP": -10.91,
+  "RotBonds": 3,
+  "n_N": 16,
+  "n_O": 3,
+  "why": "Uncapped z-score CO2 run, late episode: packs many amines into one scaffold to inflate basicity/physchem \u2014 high policy, chemically absurd for capture solvents."
+}

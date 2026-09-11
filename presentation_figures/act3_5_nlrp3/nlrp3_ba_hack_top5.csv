@@ -1,0 +1,6 @@
+rank,SMILES,Binding_Affinity,Synthesizability_Score,Molecular_Weight,LogP,Rotatable_Bonds,HBA,HBD,formal_charge
+1,COc1ccccc1C(=O)Nc1ccccc1C(=O)OCCCCCOC(=O)c1ccccc1C(=O)c1ccccc1C,47.9888,2.8656,579.6,6.671,13,7,1,0
+2,COc1ccccc1C(=O)Nc1ccccc1C(=O)OC(C)C(=O)Nc1ccccc1C(=O)OCCC(C)C,44.3446,3.3201,532.6,5.334,11,7,2,0
+3,COc1ccccc1C(=O)NC(CC(C)C)C(=O)OCc1ccccc1C(=O)OCC(=O)c1ccccc1,43.7054,3.0824,517.6,4.623,12,7,1,0
+4,CC(C)(C)OC(=O)Nc1ccccc1C(=O)NC(CCCCCCCCCCBr)C(=O)OC(C)(C)C,43.2968,2.8217,569.6,7.380,14,5,2,0
+5,COc1ccccc1C(=O)NC(CCc1ccccc1)C(=O)OCC[N+](C)(CC)Cc1ccccc1,42.4065,3.3871,489.6,4.636,13,4,1,1

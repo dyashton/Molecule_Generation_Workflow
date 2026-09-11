@@ -1,0 +1,6 @@
+rank,SMILES,affinity_score,raw_physchem,policy,n_amine,motifs,reject_notes,source
+1,NCCNC(CN)CC(O)C(N)CNCC(CNCC(N)CO)NCC(N)CO,11.0,15.27078807076238,15.27078807076238,9,unh1_2=4;amine=9;oh=3;guan=0;amid=0;amino_oh=1,,outputs/output_1/20260727_094442_co2_full_ceil/analysis/data/top_hits.csv
+2,CC(C)CC(CNCC(O)CN)NCC(O)CNCC(O)CNC(C)C(N)C[S+](C)[O-],11.0,14.789392367266323,14.789392367266323,6,unh1_2=3;amine=6;oh=3;guan=0;amid=0;amino_oh=1,,outputs/output_1/20260727_094442_co2_full_ceil/analysis/data/top_hits.csv
+3,CCSCC(O)CNC(CNCC(N)CN)CNCC(N)CNC(COC(C)=O)C(=O)O,11.0,14.288587956821097,14.288587956821097,7,unh1_2=3;amine=7;oh=2;guan=0;amid=0;amino_oh=1,,outputs/output_1/20260727_094442_co2_full_ceil/analysis/data/top_hits.csv
+4,OCCN1CCNCCNCCNCCN(CCO)CCOCC1,11.0,10.827135620841666,8.027135620841847,5,unh1_2=3;amine=5;oh=2;guan=0;amid=0;amino_oh=1,,outputs/output_1/20260903_171254_co2_full_z_uncapped/molecule_snapshots/ep310.csv
+5,CCOC1OC(CN)C(N)C(SC2OC(CO)C(O)C(N)C2N)C1OCCOC(N)N,11.0,9.890418811060664,6.972834195085415,6,unh1_2=3;amine=6;oh=2;guan=0;amid=0;amino_oh=1,,outputs/output_1/20260731_120052_co2_full_z_uncapped/molecule_snapshots/ep530.csv

@@ -1,0 +1,20 @@
+{
+    "performance_metrics": {
+        "Train_R2": 0.9844094519670006,
+        "Test_R2": 0.6696914356667585,
+        "Train_MAE": 0.5805016737554103,
+        "Test_MAE": 5.449655398350135,
+        "Train_RMSE": 1.5628283607572622,
+        "Test_RMSE": 7.4522298162286456
+    },
+    "best_hyperparameters": {
+        "max_depth": 7,
+        "lambda": 10.86833926350033,
+        "alpha": 1.4585900463924724,
+        "min_child_weight": 3,
+        "learning_rate": 0.01591293923016053,
+        "subsample": 0.8752706432206415,
+        "colsample_bytree": 0.636157609843309,
+        "n_estimators": 1708
+    }
+}

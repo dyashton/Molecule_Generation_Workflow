@@ -1,0 +1,6 @@
+rank,SMILES,reward,MW,LogP,RotBonds,n_N,n_O,source
+1,CCN(CC)CCN1CC(O)C(O)C1COC(C)=O,0.9971,274.4,-0.70,7,2,4,outputs/output_1/20260820_121153_co2_full_z_ceil/analysis/data/top_hits.csv
+2,CCNC1C(OCC)OC(CN)C(O)C1OC(C)=O,0.9947,276.3,-1.02,6,2,5,outputs/output_1/20260821_113159_co2_full_z_ceil/analysis/data/top_hits.csv
+3,CC1(C)CCC(O)(CN)C1OCC1OC(CN)C(O)C1OCCN,0.9946,347.5,-1.69,8,3,5,outputs/output_1/20260820_163256_co2_full_z_ceil/analysis/data/top_hits.csv
+4,CN(C)C(C)(CO)CN=C(O)CNC(C)(C)CO,0.9936,261.4,-0.38,8,3,3,outputs/output_1/20260817_110506_co2_full_z_ceil/analysis_1/data/top_hits.csv
+5,Cc1ccc(CNCC2(O)CNCC(O)C2O)o1,0.9935,256.3,-1.27,4,2,4,outputs/output_1/20260820_163256_co2_full_z_ceil/analysis/data/top_hits.csv

@@ -1,0 +1,107 @@
+DEVICE: 'cuda:0'
+RANDOM_SEED: 42
+RUN_NAME: co2_nopf
+
+OUTPUTS:
+  DIR: ./outputs/output_1
+
+MODEL:
+  N_LAYERS: 8
+  N_HEADS: 8
+  N_EMBD: 256
+  MAX_LEN: 100
+  NUM_PROPS: 0
+  EMBD_PDROP: 0.1
+  RESID_PDROP: 0.1
+  ATTN_PDROP: 0.1
+  VOCAB_SIZE: 94
+
+GENERATE:
+  CONTEXT: C
+  BATCH_SIZE: 64
+  N_CPU: 8
+  VERSION: nc
+  TEMPERATURE: 0.7
+  TEMPLATES: ['']
+  CKPT_PATH: weights/guacamol_nc.pt
+  OUTPUT: transpharmer/output/generate_nc/out.csv
+  N_REPEAT: 64
+
+RL_TRAIN:
+  N_EPISODES: 10000
+  BATCH_SIZE: 128
+  BASELINE_MOMENTUM: 0.9
+  ENTROPY_COEF: 0.08
+  ENTROPY_COEF_START: 0.08
+  ENTROPY_COEF_END: 0.06
+  TEMPERATURE_START: 1.2
+  TEMPERATURE_END: 0.90
+  EXPLORE_EPISODES: 1000
+  KL_COEF: 0.75
+  KL_COEF_START: 0.75
+  KL_COEF_END: 0.40
+  # Scaffold DF off (0 = disabled). Batch Tanimoto + entropy/KL still apply.
+  SCAFFOLD_BUCKET: 0
+  SCAFFOLD_PENALTY: 0.0
+  # Soft Morgan-FP floor vs cached prior SMILES (CO2 only). 0 = disabled.
+  PRIOR_FP_FLOOR: 0.3
+  PRIOR_FP_BANK_SIZE: 2048
+  PRIOR_FP_CACHE: ./weights/prior_fp_bank.smi
+  # Hierarchical chemical tether (policy-loss term). 0 = disabled (default).
+  # Independent of KL and PRIOR_FP — leave those on for the current stack.
+  # Combined d is in bank-NN units (d'_c = d_c / s_c; typical ≈ 1). λ is a vote.
+  CHEM_TETHER_COEF: 0.75
+  CHEM_TETHER_COEF_START: 0.75
+  CHEM_TETHER_COEF_END: 0.75
+  CHEM_TETHER_LAMBDA_MORGAN: 1.0
+  CHEM_TETHER_LAMBDA_2D: 1.0
+  CHEM_TETHER_LAMBDA_3D: 1.0
+  CHEM_TETHER_K: 1
+  CHEM_TETHER_BANK: ./weights/chem_tether_bank.npz
+  CHEM_TETHER_2D_MODEL: DeepChem/ChemBERTa-77M-MLM
+  CHEM_TETHER_LOG: false   # distances on eval/snapshots even if coef=0
+  # Mode I regularize (default): minimize NN distance d.
+  # Mode II explore: cost (d − D*)²; set PRIOR_FP_FLOOR: 0 for explore runs.
+  CHEM_TETHER_MODE: regularize          # regularize | explore
+  CHEM_TETHER_D_STAR_SCHEDULE: static   # static | adaptive (explore only)
+  CHEM_TETHER_D_STAR: 1.0               # NN-units (1 = typical bank neighbor)
+  CHEM_TETHER_D_STAR_START: 0.8         # adaptive only
+  CHEM_TETHER_D_STAR_END: 1.5           # adaptive only
+  # explore static shell:  MODE=explore, SCHEDULE=static, D_STAR=1.0, PRIOR_FP_FLOOR=0
+  # explore curriculum:    MODE=explore, SCHEDULE=adaptive, D_STAR_START/END=0.8→1.5, PRIOR_FP_FLOOR=0
+  # Later comparison (pick one; do not change defaults in this file):
+  # 1 current:     KL on, PRIOR_FP_FLOOR 0.3, CHEM_TETHER_COEF 0
+  # 2 kl_only:     PRIOR_FP_FLOOR 0, CHEM_TETHER_COEF 0
+  # 3 prior_fp:    KL_COEF_START/END 0, CHEM_TETHER_COEF 0
+  # 4 chem_tether: KL_COEF_START/END 0, PRIOR_FP_FLOOR 0, CHEM_TETHER_COEF 0.75→0.40
+  # Optional: CHEM_TETHER_LOG true on (2) and (3) to record manifold drift
+  REWARD_WORKERS: 4
+  INCEPTION_CAPACITY: 128
+  INCEPTION_BATCH: 4
+  INCEPTION_BATCH_BOOST: 16
+  INCEPTION_BOOST_PATIENCE: 25
+  INCEPTION_MAX_FRAC: 0.25
+  GRAD_NORM_CLIP: 0.5
+  SAVE_EVERY: 50
+  KEEP_LAST_N_PERIODIC: 0  # 0 = keep all periodics (every SAVE_EVERY)
+  MIN_GATED: 8
+  TOP_QUANTILE: 0.5
+  TOP_QUANTILE_START: 1.0
+  TOP_QUANTILE_END: 0.7
+  MONITOR_EMA_MOMENTUM: 0.9
+  DECLINE_PATIENCE: 200
+  DECLINE_MARGIN: 0.08
+  # Pause inception + block best.pt updates when unique gated frac is below floor.
+  UNIQUE_GATED_FRAC_FLOOR: 0.10
+  EARLY_STOP_PATIENCE: 400
+  EVAL_EVERY: 50
+  EVAL_BATCH_SIZE: 128
+  SAVE_MOLECULE_SNAPSHOTS: true
+  SNAPSHOT_EVERY: 10
+  SNAPSHOT_BATCH_SIZE: 64
+  OPTIM:
+    BETAS: [0.9, 0.95]
+    WEIGHT_DECAY: 0.02
+  LR:
+    LEARNING_RATE: 0.00001
+    WEIGHT_DECAY: 0.02

@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+.env.*
+
+# Training / inference artifacts
+outputs/
+inference_outputs/
+logs/
+
+# Large local datasets (download separately)
+data/
+
+# Weights: keep small shipped priors; ignore other checkpoints
+*.pt
+!weights/guacamol_nc.pt
+!weights/chem_tether_bank.npz

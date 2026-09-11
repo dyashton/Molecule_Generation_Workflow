@@ -1,0 +1,28 @@
+DEVICE: 'cuda:0'
+RANDOM_SEED: 42
+RUN_NAME: inference_run
+
+OUTPUTS:
+  DIR: ./inference_outputs
+
+MODEL:
+  N_LAYERS: 8
+  N_HEADS: 8
+  N_EMBD: 256
+  MAX_LEN: 100
+  NUM_PROPS: 0
+  EMBD_PDROP: 0.1
+  RESID_PDROP: 0.1
+  ATTN_PDROP: 0.1
+  VOCAB_SIZE: 94
+
+GENERATE:
+  CONTEXT: C
+  BATCH_SIZE: 2048
+  N_CPU: 1
+  VERSION: nc
+  TEMPERATURE: 1.5
+  TEMPLATES: ['']
+  CKPT_PATH: weights/guacamol_nc.pt
+  OUTPUT: inference_outputs/inference_run/raw_smiles.csv
+  N_REPEAT: 64
