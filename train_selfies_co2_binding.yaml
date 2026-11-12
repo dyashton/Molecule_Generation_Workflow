@@ -1,0 +1,18 @@
+# RL fine-tune for the hybrid CO2 binding predictor (HPC contract: IE head).
+# Requires: bash scripts/fetch_binding_pack.sh
+RUN_NAME: co2_binding_surrogate
+DEVICE: auto
+OUTPUT:
+  DIR: ./outputs/co2_binding_surrogate
+PRIOR:
+  CKPT_PATH: weights/guacamol_nc_selfies_medium_co2.pt
+RL_TRAIN:
+  BATCH_SIZE: 256
+  N_EPOCHS: 200
+  INORGANIC_PENALTY: 0.0
+  CHARGED_PENALTY: 0.0
+# Env (set by scripts/run_co2_binding_rl.sh):
+#   MGW_OBJECTIVE=co2_binding_surrogate
+#   MGW_BINDING_PACK=$PWD/artifacts/binding_predictor/pack.joblib
+#   MGW_BINDING_HEAD=ie
+#   MGW_BINDING_STRONG_BONUS=0.5

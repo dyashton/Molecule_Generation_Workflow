@@ -10,11 +10,26 @@ __pycache__/
 outputs/
 inference_outputs/
 logs/
+artifacts/discovery/
+artifacts/binding_predictor/*.joblib
+artifacts/binding_predictor.tar.gz
+!artifacts/binding_predictor/.gitkeep
+
 
 # Large local datasets (download separately)
 data/
+!data/mixed_selfies/
+!data/mixed_selfies/vocab.json
+third_party/
 
 # Weights: keep small shipped priors; ignore other checkpoints
 *.pt
 !weights/guacamol_nc.pt
+!weights/guacamol_nc_selfies_medium_co2.pt
 !weights/chem_tether_bank.npz
+!weights/fe_ligand_tether_bank.npz
+weights/feoml/*.joblib
+
+# Binding pack joblibs stay out of git (use fetch / release tarball)
+artifacts/binding_predictor.tar.gz
+

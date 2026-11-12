@@ -19,9 +19,16 @@ dependencies = [
     "joblib",
     "scipy",
     "biopython",
-    "scikit-learn==1.6.1",
+    "scikit-learn>=1.6.1",
     "dotenv>=0.9.9",
     "umap-learn>=0.5.12",
+    "openpyxl>=3.1.5",
+    "ripser>=0.6.15",
+    "selfies>=2.2.0",
+    "admet-ai>=2.0.1",
+    "vina>=1.2.7",
+    "meeko>=0.8.0",
+    "gemmi>=0.7.5",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +36,14 @@ tether = [
     "transformers",
     "unimol_tools",
 ]
+preference = [
+    "co2ie",
+]
+# HPC note: co2_binding_surrogate also works with vendored vendor/co2ie
+# (surrogate-only) without installing the full CO2_IE_Dataset package.
+
+[tool.uv.sources]
+co2ie = { path = "../CO2_IE_Dataset", editable = true }
 
 [dependency-groups]
 dev = [

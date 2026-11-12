@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from rdkit import Chem
@@ -23,7 +24,9 @@ from objectives.co2_reward import CO2ObjectiveScorer
 from objectives.diversity import tanimoto_diversity_scores
 from objectives.druglike_reward import get_druglike_scorer
 from objectives.unbounded_proxy_reward import get_unbounded_proxy_scorer
+from objectives.feoml_barrier_reward import get_feoml_objective_scorer
 from objectives.filters import FilterConfig, passes_filters
+from objectives.prior_fp_tether import PriorFPTether, load_smiles_cache
 from objectives.shape_exclusion import ShapeExclusionScreener
 from objectives.synthesizability import SynthesizabilityScorer
 from dotenv import load_dotenv
@@ -41,6 +44,8 @@ _BA_SCORER: BindingAffinityScorer | None = None
 _SE_SCREENER: ShapeExclusionScreener | None = None
 _SA_SCORER: SynthesizabilityScorer | None = None
 _CO2_SCORER: CO2ObjectiveScorer | None = None
+_UNCONDITIONAL_FP_TETHER: PriorFPTether | None = None
+_NOVELTY_DIVERSITY_SCORER = None
 _CO2_SCORER_KWARGS: dict = {
     "random_seed": 42,
     "n_conformers": 2,
@@ -70,6 +75,18 @@ class RewardBatch:
     quality: list[float]
     # CO2: multiplicative MW scale [0,1]. Druglike: MolLogP. NLRP: nans.
     mw_scale: list[float]
+    # Optional uncertainty from an ensemble surrogate.
+    surrogate_uncertainty: list[float] | None = None
+    # Surrogate-only inorganic search-space penalty diagnostics.
+    inorganic_atom_count: list[int] | None = None
+    inorganic_penalty: list[float] | None = None
+    charged_atom_count: list[int] | None = None
+    charged_penalty: list[float] | None = None
+    mw_penalty: list[float] | None = None
+    # M4 selectivity margins. Unused by other objectives.
+    sel_m4_m1: list[float] | None = None
+    sel_m4_m3: list[float] | None = None
+    sel_m1_m3: list[float] | None = None
 
 
 def _profile_rewards_enabled() -> bool:
@@ -96,6 +113,14 @@ def _objective_name() -> str:
     - MGW_OBJECTIVE=co2
     - MGW_OBJECTIVE=druglike
     - MGW_OBJECTIVE=unbounded_proxy  (needs MGW_PROXY=...)
+    - MGW_OBJECTIVE=feoml_barrier    (FeOML PI→KRR −Δ‡; in-family only)
+    - MGW_OBJECTIVE=cb_gated         (CB pKi + P(active) bonus − penalties)
+    - MGW_OBJECTIVE=muace4           (M4 pKi + drug-like / selectivity / ADMET terms)
+    - MGW_OBJECTIVE=co2_chem         (S_attack at one nitrogen − MW/SCScore)
+    - MGW_OBJECTIVE=unconditional_diversity (batch Morgan diversity)
+    - MGW_OBJECTIVE=novelty_diversity (Morgan/scaffold novelty and diversity)
+    - MGW_OBJECTIVE=offline_div_cage (diversity − MW/SCScore exp penalties)
+    - MGW_OBJECTIVE=co2_binding_surrogate (IE/BE+penalty BE_GM pack + OOD gate)
     """
     return os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
 
@@ -139,6 +164,28 @@ def ensure_co2_scorer() -> CO2ObjectiveScorer:
     return _get_co2_scorer()
 
 
+def configure_unconditional_diversity(
+    *, prior_fp_floor: float = 0.0, prior_fp_bank: str | None = None
+) -> None:
+    """Configure the unconditional diversity objective and optional FP floor."""
+    global _UNCONDITIONAL_FP_TETHER
+    tether = PriorFPTether(floor=float(prior_fp_floor))
+    if prior_fp_bank:
+        tether.set_bank(load_smiles_cache(Path(prior_fp_bank)))
+    _UNCONDITIONAL_FP_TETHER = tether
+
+
+def unconditional_prior_fp_tether() -> PriorFPTether | None:
+    return _UNCONDITIONAL_FP_TETHER
+
+
+def configure_novelty_diversity_scorer(**kwargs) -> None:
+    global _NOVELTY_DIVERSITY_SCORER
+    from objectives.novelty_diversity_reward import NoveltyDiversityScorer
+
+    _NOVELTY_DIVERSITY_SCORER = NoveltyDiversityScorer(**kwargs)
+
+
 def _get_co2_scorer() -> CO2ObjectiveScorer:
     global _CO2_SCORER
     if _CO2_SCORER is None:
@@ -177,6 +224,62 @@ def compute_reward_batch(smiles_list: list[str]) -> RewardBatch:
             mw_scale=batch.mw_scale,
         )
 
+    if _objective_name() == "co2_ie_surrogate":
+        from objectives.co2_ie_surrogate import get_surrogate_scorer
+
+        return get_surrogate_scorer().compute_batch(smiles_list)
+
+    if _objective_name() == "co2_binding_surrogate":
+        from objectives.co2_binding_surrogate import get_binding_surrogate_scorer
+
+        return get_binding_surrogate_scorer().compute_batch(smiles_list)
+
+    if _objective_name() == "co2_chem":
+        from objectives.co2_chem_reward import get_chem_scorer
+
+        return get_chem_scorer().compute_batch(smiles_list)
+
+    if _objective_name() == "unconditional_diversity":
+        diversity = tanimoto_diversity_scores(smiles_list).astype(np.float64)
+        gate_ok = [Chem.MolFromSmiles(smi) is not None for smi in smiles_list]
+        tether = _UNCONDITIONAL_FP_TETHER
+        if tether is not None and tether.enabled:
+            for i, smi in enumerate(smiles_list):
+                if gate_ok[i]:
+                    diversity[i] *= tether.factor(smi)
+        diversity[~np.asarray(gate_ok, dtype=bool)] = np.nan
+        values = [float(value) for value in diversity.tolist()]
+        return RewardBatch(
+            policy=values,
+            raw_total=values.copy(),
+            raw_ba=[float("nan")] * len(smiles_list),
+            raw_div=values.copy(),
+            gate_ok=gate_ok,
+            raw_physchem=[float("nan")] * len(smiles_list),
+            quality=values.copy(),
+            mw_scale=[float("nan")] * len(smiles_list),
+        )
+
+    if _objective_name() == "novelty_diversity":
+        if _NOVELTY_DIVERSITY_SCORER is None:
+            raise RuntimeError("Novelty/diversity scorer is not configured")
+        return _NOVELTY_DIVERSITY_SCORER.compute_batch(smiles_list)
+
+    if _objective_name() == "offline_div_cage":
+        from objectives.offline_div_cage_reward import get_offline_div_cage_scorer
+
+        return get_offline_div_cage_scorer().compute_batch(smiles_list)
+
+    if _objective_name() == "cb_gated":
+        from objectives.cb_gated_surrogate import get_cb_gated_scorer
+
+        return get_cb_gated_scorer().compute_batch(smiles_list)
+
+    if _objective_name() == "muace4":
+        from objectives.muace4_reward import get_muace4_scorer
+
+        return get_muace4_scorer().compute_batch(smiles_list)
+
     if _objective_name() == "druglike":
         # Slot map: raw_ba=logit(QED), raw_div=−log freq, raw_physchem=−SCScore, mw_scale=MolLogP.
         batch = get_druglike_scorer().compute_batch(smiles_list)
@@ -204,6 +307,20 @@ def compute_reward_batch(smiles_list: list[str]) -> RewardBatch:
             raw_physchem=batch.molwt,
             quality=batch.quality,
             mw_scale=batch.heavyatomcount,
+        )
+
+    if _objective_name() == "feoml_barrier":
+        # Slot map: raw_total=quality=−barrier; raw_ba=barrier; raw_physchem=spin_code.
+        batch = get_feoml_objective_scorer().compute_batch(smiles_list)
+        return RewardBatch(
+            policy=batch.policy,
+            raw_total=batch.raw_total,
+            raw_ba=batch.barrier,
+            raw_div=[float("nan")] * len(smiles_list),
+            gate_ok=batch.gate_ok,
+            raw_physchem=batch.spin_code,
+            quality=batch.quality,
+            mw_scale=[float("nan")] * len(smiles_list),
         )
 
     profile = _profile_rewards_enabled()

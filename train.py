@@ -51,9 +51,20 @@ from reward import (
     RewardBatch,
     compute_reward_batch,
     configure_co2_scorer,
+    configure_novelty_diversity_scorer,
+    configure_unconditional_diversity,
     ensure_co2_scorer,
+    unconditional_prior_fp_tether,
 )
-from transpharmer.dataset import pad_token, stoi, tokenize, untokenize
+from transpharmer.dataset import (
+    configure_from_config,
+    pad_token,
+    stoi,
+    tokenize,
+    tokenize_from_smiles,
+    tokens_to_smiles,
+    untokenize,
+)
 from transpharmer.model import GPT, sample
 from transpharmer.SMILEValidifier import valid_smiles
 from transpharmer.utils.io import load_config
@@ -63,7 +74,53 @@ from transpharmer.utils.seed import set_seed
 
 
 def _co2_objective() -> bool:
-    return os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower() == "co2"
+    """Gated RL path (thin-batch skip, gated-only learn set, EMA early-stop).
+
+    Historically named for CO2; FeOML uses the same machinery so off-family
+    molecules do not get REINFORCE updates.
+    """
+    obj = os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
+    return obj in ("co2", "feoml_barrier", "co2_chem")
+
+
+def _chem_objective() -> bool:
+    return os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower() == "co2_chem"
+
+
+def _diversity_objective() -> bool:
+    return (
+        os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
+        == "unconditional_diversity"
+    )
+
+
+def _novelty_diversity_objective() -> bool:
+    return (
+        os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
+        == "novelty_diversity"
+    )
+
+
+def _offline_div_cage_objective() -> bool:
+    return (
+        os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
+        == "offline_div_cage"
+    )
+
+
+def _exploration_objective() -> bool:
+    return (
+        _diversity_objective()
+        or _novelty_diversity_objective()
+        or _offline_div_cage_objective()
+    )
+
+
+def _surrogate_objective() -> bool:
+    return os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower() in {
+        "co2_ie_surrogate",
+        "co2_binding_surrogate",
+    }
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -73,9 +130,24 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _resolve_device(config) -> str:
+    requested = str(config.DEVICE).strip().lower()
+    if requested != "auto":
+        return str(config.DEVICE)
+    batch_size = int(getattr(config.RL_TRAIN, "BATCH_SIZE", 0))
+    micro_batch_size = int(
+        getattr(config.RL_TRAIN, "MICRO_BATCH_SIZE", batch_size)
+    )
+    if micro_batch_size <= 256 and torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
+
+
 def _run_name_from_env_or_config(config_run_name: str) -> str:
     """CO2/druglike get env-based names; else YAML RUN_NAME."""
     obj = os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
+    if obj == "co2_chem":
+        return "co2_chem"
     if obj == "druglike":
         return "druglike"
     if obj == "unbounded_proxy":
@@ -161,7 +233,11 @@ def _print_episode_summary(
         f"unique_gated {int(metrics.get('n_unique_gated') or 0)} "
         f"({_fmt_pct(int(metrics.get('n_unique_gated') or 0), batch_size)})  "
         f"policy_batch {n_learn}  elite_replay {n_replay}"
-        + (f"  boost" if metrics.get("inception_boost") else ""),
+        + (
+            "  boost"
+            if metrics.get("inception_boost") or metrics.get("collapse_boost")
+            else ""
+        ),
         flush=True,
     )
     if n_gated > 0:
@@ -318,6 +394,11 @@ def _write_molecule_snapshot(
         "gate_ok",
         "raw_physchem",
         "quality",
+        "inorganic_atom_count",
+        "inorganic_penalty",
+        "charged_atom_count",
+        "charged_penalty",
+        "mw_penalty",
         "mw_scale",
         "raw_ba",
         "raw_div",
@@ -356,6 +437,31 @@ def _write_molecule_snapshot(
                     batch.gate_ok[valid_i],
                     batch.raw_physchem[valid_i],
                     batch.quality[valid_i],
+                    (
+                        batch.inorganic_atom_count[valid_i]
+                        if batch.inorganic_atom_count is not None
+                        else nan
+                    ),
+                    (
+                        batch.inorganic_penalty[valid_i]
+                        if batch.inorganic_penalty is not None
+                        else nan
+                    ),
+                    (
+                        batch.charged_atom_count[valid_i]
+                        if batch.charged_atom_count is not None
+                        else nan
+                    ),
+                    (
+                        batch.charged_penalty[valid_i]
+                        if batch.charged_penalty is not None
+                        else nan
+                    ),
+                    (
+                        batch.mw_penalty[valid_i]
+                        if batch.mw_penalty is not None
+                        else nan
+                    ),
                     batch.mw_scale[valid_i],
                     batch.raw_ba[valid_i],
                     batch.raw_div[valid_i],
@@ -375,6 +481,10 @@ def _write_molecule_snapshot(
                     nan,
                     nan,
                     False,
+                    nan,
+                    nan,
+                    nan,
+                    nan,
                     nan,
                     nan,
                     nan,
@@ -440,6 +550,10 @@ class RLPipeline:
         self.config_path = Path(config_path).resolve()
         self.config_dir = self.config_path.parent
         self.config = load_config(str(self.config_path))
+        self.config.defrost()
+        self.config.DEVICE = _resolve_device(self.config)
+        self.config.freeze()
+        configure_from_config(self.config)
 
         out_root = _resolve(self.config_dir, str(self.config.OUTPUTS.DIR))
         self.run_name = _run_name_from_env_or_config(
@@ -490,6 +604,9 @@ class RLPipeline:
         self.save_every = int(self.config.RL_TRAIN.SAVE_EVERY)
         self.keep_last_n_periodic = int(self.config.RL_TRAIN.KEEP_LAST_N_PERIODIC)
         rl = self.config.RL_TRAIN
+        self.micro_batch_size = max(
+            1, int(getattr(rl, "MICRO_BATCH_SIZE", rl.BATCH_SIZE))
+        )
         self.min_gated = int(getattr(rl, "MIN_GATED", 8))
         top_q_default = float(getattr(rl, "TOP_QUANTILE", 1.0))
         self.top_quantile_start = float(
@@ -523,6 +640,10 @@ class RLPipeline:
         self.kl_coef_end = float(getattr(rl, "KL_COEF_END", kl_default))
         self.kl_coef = self.kl_coef_start
         self.explore_episodes = int(getattr(rl, "EXPLORE_EPISODES", 0))
+        # 0 → entropy shares EXPLORE_EPISODES with temperature.
+        self.entropy_explore_episodes = int(
+            getattr(rl, "ENTROPY_EXPLORE_EPISODES", 0)
+        )
         entropy_default = float(self.config.RL_TRAIN.ENTROPY_COEF)
         self.entropy_coef_start = float(
             getattr(rl, "ENTROPY_COEF_START", entropy_default)
@@ -550,6 +671,8 @@ class RLPipeline:
         self.current_temperature = self.temperature_start
         self.entropy_coef = self.entropy_coef_start
         self.co2_mode = _co2_objective()
+        self.inorganic_penalty = 0.0
+        self.charged_penalty = 0.0
         self.prior_fp_floor = float(getattr(rl, "PRIOR_FP_FLOOR", 0.0))
         self.prior_fp_bank_size = int(getattr(rl, "PRIOR_FP_BANK_SIZE", 2048))
         self.prior_fp_cache = _resolve(
@@ -596,7 +719,22 @@ class RLPipeline:
             getattr(rl, "CHEM_TETHER_D_STAR_START", 0.8)
         )
         self.chem_tether_d_star_end = float(getattr(rl, "CHEM_TETHER_D_STAR_END", 1.5))
+        self.chem_tether_cage_growth = float(
+            getattr(rl, "CHEM_TETHER_CAGE_GROWTH", 1.0)
+        )
         self.chem_tether_d_star = float("nan")
+        # If batch uniqueness drops, raise temp/entropy next episode (collapse rescue).
+        self.collapse_unique_floor = float(
+            getattr(rl, "COLLAPSE_UNIQUE_FLOOR", 0.0)
+        )
+        self.collapse_temperature = float(
+            getattr(rl, "COLLAPSE_TEMPERATURE", self.temperature_start)
+        )
+        self.collapse_entropy_coef = float(
+            getattr(rl, "COLLAPSE_ENTROPY_COEF", self.entropy_coef_start)
+        )
+        self.collapse_boost_active = False
+        self.last_unique_gated_frac = float("nan")
         log_raw = getattr(rl, "CHEM_TETHER_LOG", False)
         if isinstance(log_raw, str):
             self.chem_tether_log = log_raw.strip().lower() not in (
@@ -614,7 +752,11 @@ class RLPipeline:
             getattr(rl, "CHEM_TETHER_COST_EMA", 0.9)
         )
         self.chem_tether: ChemicalTether | None = None
-        if self.co2_mode:
+        if _chem_objective():
+            self.include_pfc = False
+            self.use_objective_ceilings = False
+            self.use_sigmoid_reward = False
+        elif self.co2_mode:
             configure_co2_scorer(
                 scaffold_bucket=int(getattr(rl, "SCAFFOLD_BUCKET", 0)),
                 scaffold_penalty=float(getattr(rl, "SCAFFOLD_PENALTY", 0.0)),
@@ -627,6 +769,26 @@ class RLPipeline:
             self.include_pfc = bool(scorer.include_pfc)
             self.use_objective_ceilings = bool(scorer.use_objective_ceilings)
             self.use_sigmoid_reward = bool(scorer.use_sigmoid_reward)
+        elif _surrogate_objective():
+            obj = os.environ.get("MGW_OBJECTIVE", "nlrp").strip().lower()
+            if obj == "co2_binding_surrogate":
+                from objectives.co2_binding_surrogate import (
+                    configure_binding_surrogate_scorer,
+                )
+
+                configure_binding_surrogate_scorer(
+                    inorganic_penalty=float(getattr(rl, "INORGANIC_PENALTY", 0.0)),
+                    charged_penalty=float(getattr(rl, "CHARGED_PENALTY", 0.0)),
+                )
+            else:
+                from objectives.co2_ie_surrogate import configure_surrogate_scorer
+
+                configure_surrogate_scorer(
+                    inorganic_penalty=float(getattr(rl, "INORGANIC_PENALTY", 0.0)),
+                    charged_penalty=float(getattr(rl, "CHARGED_PENALTY", 0.0)),
+                )
+            self.inorganic_penalty = float(getattr(rl, "INORGANIC_PENALTY", 0.0))
+            self.charged_penalty = float(getattr(rl, "CHARGED_PENALTY", 0.0))
         else:
             self.include_pfc = True
             self.use_objective_ceilings = False
@@ -654,10 +816,17 @@ class RLPipeline:
             f"mode={self.chem_tether_mode}, "
             f"entropy={self.entropy_coef_start}→{self.entropy_coef_end}, "
             f"temp={self.temperature_start}→{self.temperature_end}, "
-            f"top_q={self.top_quantile_start}→{self.top_quantile_end}",
+            f"top_q={self.top_quantile_start}→{self.top_quantile_end}, "
+            f"batch={self.config.RL_TRAIN.BATCH_SIZE}/micro={self.micro_batch_size}",
             flush=True,
         )
-        if self.co2_mode:
+        if _chem_objective():
+            print(
+                "CO2 chemisorption RL mode: S_attack − MW/SCScore; "
+                f"min_gated={self.min_gated}",
+                flush=True,
+            )
+        elif self.co2_mode:
             pfc_bit = "physchem+PFC" if self.include_pfc else "physchem (no PFC)"
             score_bit = "sigmoid(RANGES)" if self.use_sigmoid_reward else "z-score"
             print(
@@ -683,6 +852,12 @@ class RLPipeline:
                 f"lr={getattr(rl.LR, 'LEARNING_RATE', '?')}",
                 flush=True,
             )
+        elif _surrogate_objective():
+            print(
+                f"Surrogate IE RL mode: inorganic_penalty={self.inorganic_penalty}, "
+                f"charged_penalty={self.charged_penalty}",
+                flush=True,
+            )
 
         if self.config.DEVICE == "cpu":
             checkpoint = torch.load(
@@ -702,8 +877,23 @@ class RLPipeline:
         self.model = self.model.to(self.device)
         self.optimizer = build_optimizer(self.model, self.config.RL_TRAIN)
         self.ref_model = self._build_ref_model()
-        if self.co2_mode and self.prior_fp_floor > 0:
+        if self.prior_fp_floor > 0 and (
+            _diversity_objective() or (self.co2_mode and not _chem_objective())
+        ):
             self._ensure_prior_fp_bank()
+        if _novelty_diversity_objective():
+            configure_novelty_diversity_scorer(
+                bank_path=_resolve(
+                    self.config_dir,
+                    str(getattr(rl, "EXPLORATION_BANK", "../data/guacamol_fp_bank.smi")),
+                ),
+                invalid_penalty=float(getattr(rl, "INVALID_PENALTY", -1.0)),
+                prior_fp_floor=float(getattr(rl, "PRIOR_FP_FLOOR", 0.0)),
+                w_morgan_diversity=float(getattr(rl, "W_MORGAN_DIVERSITY", 0.25)),
+                w_scaffold_diversity=float(getattr(rl, "W_SCAFFOLD_DIVERSITY", 0.25)),
+                w_morgan_novelty=float(getattr(rl, "W_MORGAN_NOVELTY", 0.25)),
+                w_scaffold_novelty=float(getattr(rl, "W_SCAFFOLD_NOVELTY", 0.25)),
+            )
         self._maybe_load_chem_tether()
 
         if self.device == "cuda" or str(self.device).startswith("cuda:"):
@@ -813,6 +1003,73 @@ class RLPipeline:
             )
 
         set_seed(self.config.RANDOM_SEED)
+        self._maybe_seed_elite_buffer()
+
+    def _maybe_seed_elite_buffer(self) -> None:
+        """Preload elite replay from a scored CSV (FeOML library tops).
+
+        Expects columns ``smiles`` + ``barrier`` (quality = −barrier) or ``quality``.
+        Config: RL_TRAIN.ELITE_SEED_CSV / ELITE_SEED_TOP_K, or env MGW_FEOML_ELITE_SEED.
+        """
+        rl = self.config.RL_TRAIN
+        path_raw = getattr(rl, "ELITE_SEED_CSV", None) or os.environ.get(
+            "MGW_FEOML_ELITE_SEED", ""
+        )
+        path_raw = str(path_raw or "").strip()
+        if not path_raw:
+            return
+        path = Path(path_raw)
+        if not path.is_absolute():
+            path = _resolve(self.config_dir, path_raw)
+        if not path.is_file():
+            print(f"Elite seed CSV missing: {path}", flush=True)
+            return
+        top_k = int(getattr(rl, "ELITE_SEED_TOP_K", 64))
+        import pandas as pd
+        from rdkit import Chem
+
+        df = pd.read_csv(path)
+        if "smiles" not in df.columns:
+            print(f"Elite seed CSV has no smiles column: {path}", flush=True)
+            return
+        if "quality" in df.columns:
+            df = df.copy()
+            df["_q"] = pd.to_numeric(df["quality"], errors="coerce")
+        elif "barrier" in df.columns:
+            df = df.copy()
+            df["_q"] = -pd.to_numeric(df["barrier"], errors="coerce")
+        else:
+            print(
+                f"Elite seed CSV needs quality or barrier column: {path}",
+                flush=True,
+            )
+            return
+        df = df.dropna(subset=["_q"])
+        df = df.sort_values("_q", ascending=False)
+        n_offered = 0
+        best_q = float("-inf")
+        seen: set[str] = set()
+        for _, row in df.iterrows():
+            if n_offered >= max(top_k, 1):
+                break
+            smi = str(row["smiles"]).strip()
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            can = Chem.MolToSmiles(mol, canonical=True)
+            if can in seen:
+                continue
+            seen.add(can)
+            q = float(row["_q"])
+            self.elite_buffer.offer(can, q)
+            n_offered += 1
+            best_q = max(best_q, q)
+        print(
+            f"Seeded elite replay from {path.name}: offered={n_offered} "
+            f"buffer_n={len(self.elite_buffer)} best_quality={best_q:.3f} "
+            f"(≈Δ‡ {-best_q:.2f})",
+            flush=True,
+        )
 
     def _build_ref_model(self) -> GPT | None:
         """Frozen pretrained policy for KL anchoring (always from GENERATE.CKPT_PATH)."""
@@ -867,6 +1124,19 @@ class RLPipeline:
 
     def _ensure_prior_fp_bank(self) -> None:
         """Load prior SMILES cache; top up by sampling the frozen prior if short."""
+        if _diversity_objective():
+            cache = Path(self.prior_fp_cache)
+            smiles = load_smiles_cache(cache)
+            configure_unconditional_diversity(
+                prior_fp_floor=self.prior_fp_floor,
+                prior_fp_bank=str(cache),
+            )
+            print(
+                f"GuacaMol Morgan-FP bank: {cache} n={len(smiles)} "
+                f"floor={self.prior_fp_floor}",
+                flush=True,
+            )
+            return
         scorer = ensure_co2_scorer()
         target = max(int(self.prior_fp_bank_size), 1)
         cache = Path(self.prior_fp_cache)
@@ -886,7 +1156,7 @@ class RLPipeline:
             seen = set(smiles)
             # GENERATE.TEMPERATURE for bank (stable, not RL explore schedule).
             bank_temp = float(self.config.GENERATE.TEMPERATURE)
-            batch = int(self.config.RL_TRAIN.BATCH_SIZE)
+            batch = self.micro_batch_size
             guard = 0
             max_guard = max(50, (need // max(batch, 1)) * 20 + 20)
             from rdkit import Chem
@@ -956,15 +1226,23 @@ class RLPipeline:
             f"d*_sched={self.chem_tether_d_star_schedule} "
             f"d*={self.chem_tether_d_star_fixed} "
             f"d*_range={self.chem_tether_d_star_start}→{self.chem_tether_d_star_end} "
+            f"cage_growth={self.chem_tether_cage_growth} "
             f"log={self.chem_tether_log}",
             flush=True,
         )
 
     def _mean_prior_fp_factor(self, smiles: list[str]) -> float:
-        if self.prior_fp_floor <= 0.0 or not self.co2_mode:
+        if self.prior_fp_floor <= 0.0:
             return 1.0
         if not smiles:
             return float("nan")
+        if _diversity_objective():
+            tether = unconditional_prior_fp_tether()
+            if tether is None or not tether.enabled:
+                return 1.0
+            return float(np.mean([tether.factor(s) for s in smiles]))
+        if not self.co2_mode or _chem_objective():
+            return 1.0
         scorer = ensure_co2_scorer()
         tether = scorer.prior_fp_tether
         if not tether.enabled:
@@ -1018,8 +1296,9 @@ class RLPipeline:
             d,
             mode=self.chem_tether_mode,
             d_star=float(self.chem_tether_d_star)
-            if self.chem_tether_mode == "explore"
-            else 0.0,
+            if math.isfinite(float(self.chem_tether_d_star))
+            else self.chem_tether_d_star_fixed,
+            growth=self.chem_tether_cage_growth,
         )
         cost_np = cost.detach().float().cpu().numpy()
         batch_mean = _nanmean(cost_np)
@@ -1081,8 +1360,14 @@ class RLPipeline:
 
     def _apply_schedules(self, episode: int, n_episodes: int) -> None:
         progress = self._schedule_progress(episode, n_episodes)
+        if self.entropy_explore_episodes > 0:
+            entropy_progress = explore_schedule_progress(
+                episode, self.entropy_explore_episodes
+            )
+        else:
+            entropy_progress = progress
         self.entropy_coef = linear_schedule(
-            self.entropy_coef_start, self.entropy_coef_end, progress
+            self.entropy_coef_start, self.entropy_coef_end, entropy_progress
         )
         self.scheduled_temperature = linear_schedule(
             self.temperature_start, self.temperature_end, progress
@@ -1094,20 +1379,48 @@ class RLPipeline:
         self.chem_tether_coef = linear_schedule(
             self.chem_tether_coef_start, self.chem_tether_coef_end, progress
         )
-        if self.chem_tether_mode == "explore":
-            if self.chem_tether_d_star_schedule == "static":
-                self.chem_tether_d_star = self.chem_tether_d_star_fixed
-            else:
-                self.chem_tether_d_star = linear_schedule(
-                    self.chem_tether_d_star_start,
-                    self.chem_tether_d_star_end,
-                    progress,
-                )
+        if self.chem_tether_d_star_schedule == "static":
+            self.chem_tether_d_star = self.chem_tether_d_star_fixed
         else:
-            self.chem_tether_d_star = float("nan")
+            # Linear d* for both cage (regularize) and explore: loose → tight curriculum.
+            self.chem_tether_d_star = linear_schedule(
+                self.chem_tether_d_star_start,
+                self.chem_tether_d_star_end,
+                progress,
+            )
         self.top_quantile = linear_schedule(
             self.top_quantile_start, self.top_quantile_end, progress
         )
+        self._maybe_collapse_boost()
+
+    def _maybe_collapse_boost(self) -> None:
+        """Raise temp/entropy when the previous batch was too non-unique."""
+        self.collapse_boost_active = False
+        floor = float(self.collapse_unique_floor)
+        if floor <= 0.0:
+            return
+        uf = self.last_unique_gated_frac
+        if not math.isfinite(uf):
+            uf = self.unique_gated_frac_ema
+        if not math.isfinite(uf) or uf >= floor:
+            return
+        self.collapse_boost_active = True
+        self.current_temperature = max(
+            float(self.scheduled_temperature), float(self.collapse_temperature)
+        )
+        self.entropy_coef = max(
+            float(self.entropy_coef), float(self.collapse_entropy_coef)
+        )
+        if os.environ.get("MGW_OBJECTIVE", "").strip().lower() == "muace4":
+            # Novelty weight: 0 at episode 1, 1 at the last episode, over N_EPISODES.
+            nov_progress = float(episode - 1) / float(max(int(n_episodes) - 1, 1))
+            os.environ["MGW_M4_W_NOV"] = str(
+                linear_schedule(
+                    float(os.environ.get("MGW_M4_W_NOV_START", "0")),
+                    float(os.environ.get("MGW_M4_W_NOV_END", "1")),
+                    nov_progress,
+                )
+            )
 
     def _co2_monitor_payload(
         self,
@@ -1168,6 +1481,15 @@ class RLPipeline:
             context = context.repeat(batch_size, 1)
 
         context = context.to(self.device)
+        # Teacher forcing feeds tokens[:, :-1]. With context "C" that input is
+        # exactly MAX_LEN. A longer prefix has to sample fewer new tokens.
+        context_len = int(context.size(1))
+        max_len = int(self.config.MODEL.MAX_LEN)
+        steps = max_len + 1 - context_len
+        if steps < 1:
+            raise ValueError(
+                f"GENERATE.CONTEXT is {context_len} tokens and MODEL.MAX_LEN is {max_len}"
+            )
 
         if self.config.MODEL.NUM_PROPS > 0:
             import rdkit.Chem as Chem
@@ -1184,7 +1506,7 @@ class RLPipeline:
                 gen_tokens = sample(
                     model=model,
                     x=context,
-                    steps=self.config.MODEL.MAX_LEN,
+                    steps=steps,
                     temperature=temp,
                     sample_=True,
                     top_k=None,
@@ -1195,7 +1517,7 @@ class RLPipeline:
                 gen_tokens = sample(
                     model=model,
                     x=context,
-                    steps=self.config.MODEL.MAX_LEN,
+                    steps=steps,
                     temperature=temp,
                     sample_=True,
                     top_k=None,
@@ -1203,18 +1525,47 @@ class RLPipeline:
                 )
 
         gen_tokens = gen_tokens.cpu().numpy().tolist()
-        smiles_list = [untokenize(tokens) for tokens in gen_tokens]
+        smiles_list = [tokens_to_smiles(tokens) for tokens in gen_tokens]
         print(f"Generated {len(smiles_list)} molecules (temp={temp:.3f})", flush=True)
         return smiles_list, gen_tokens, context
 
+    def generate_molecules_batched(
+        self,
+        batch_size: int,
+        micro_batch_size: int | None = None,
+        temperature: float | None = None,
+        *,
+        policy: GPT | None = None,
+    ):
+        """Generate one effective batch through bounded model microbatches."""
+        chunk_size = max(1, int(micro_batch_size or self.micro_batch_size))
+        smiles: list[str] = []
+        tokens: list = []
+        context = None
+        for start in range(0, int(batch_size), chunk_size):
+            chunk = min(chunk_size, int(batch_size) - start)
+            chunk_smiles, chunk_tokens, context = self.generate_molecules(
+                batch_size=chunk,
+                temperature=temperature,
+                policy=policy,
+            )
+            smiles.extend(chunk_smiles)
+            tokens.extend(chunk_tokens)
+        return smiles, tokens, context
+
     def rl_step(self):
-        smiles_list, gen_tokens, _context = self.generate_molecules(
-            batch_size=self.config.RL_TRAIN.BATCH_SIZE
+        smiles_list, gen_tokens, _context = self.generate_molecules_batched(
+            batch_size=self.config.RL_TRAIN.BATCH_SIZE,
+            micro_batch_size=self.micro_batch_size,
         )
 
         # Keep eval() so teacher-forced log-probs match sampling (dropout off).
-        valid_indices = [i for i, smi in enumerate(smiles_list) if valid_smiles(smi)]
-        n_valid = len(valid_indices)
+        n_valid = sum(valid_smiles(smi) for smi in smiles_list)
+        valid_indices = (
+            list(range(len(smiles_list)))
+            if _exploration_objective()
+            else [i for i, smi in enumerate(smiles_list) if valid_smiles(smi)]
+        )
 
         empty = {
             "policy_loss": 0.0,
@@ -1248,7 +1599,7 @@ class RLPipeline:
         }
         empty.update(self._regularizer_metrics())
 
-        if n_valid == 0:
+        if n_valid == 0 and not _exploration_objective():
             if self.co2_mode:
                 self._update_co2_health_ema(empty)
             return empty
@@ -1261,6 +1612,18 @@ class RLPipeline:
         qualities = np.array(batch.quality, dtype=np.float64)
         gate_ok = np.array(batch.gate_ok, dtype=bool)
         mw_scales = np.array(batch.mw_scale, dtype=np.float64)
+        mw_penalties = np.array(
+            batch.mw_penalty
+            if batch.mw_penalty is not None
+            else [float("nan")] * len(smiles_list),
+            dtype=np.float64,
+        )
+        surrogate_uncertainty = np.array(
+            batch.surrogate_uncertainty
+            if batch.surrogate_uncertainty is not None
+            else [float("nan")] * len(smiles_list),
+            dtype=np.float64,
+        )
 
         policy_rewards = policy_rewards[valid_indices]
         raw_totals = raw_totals[valid_indices]
@@ -1269,7 +1632,20 @@ class RLPipeline:
         qualities = qualities[valid_indices]
         gate_ok = gate_ok[valid_indices]
         mw_scales = mw_scales[valid_indices]
+        mw_penalties = mw_penalties[valid_indices]
+        surrogate_uncertainty = surrogate_uncertainty[valid_indices]
         valid_smiles_list = [smiles_list[i] for i in valid_indices]
+
+        if _surrogate_objective():
+            return self._rl_step_surrogate(
+                policy_rewards,
+                raw_physchem,
+                surrogate_uncertainty,
+                mw_penalties,
+                gen_tokens,
+                valid_indices,
+                valid_smiles_list,
+            )
 
         if self.co2_mode:
             return self._rl_step_co2(
@@ -1286,53 +1662,94 @@ class RLPipeline:
                 n_valid=n_valid,
             )
 
-        avg_policy_reward = float(np.mean(policy_rewards))
-        avg_raw_objective = float(np.mean(raw_totals))
+        finite = np.isfinite(policy_rewards)
+        if not np.any(finite):
+            if self.co2_mode:
+                self._update_co2_health_ema(empty)
+            return empty
+
+        keep = np.flatnonzero(finite)
+        rewards = policy_rewards[keep]
+        learn_bas = raw_bas[keep]
+        learn_totals = raw_totals[keep]
+        learn_gate = gate_ok[keep]
+        learn_smiles = [valid_smiles_list[int(i)] for i in keep]
+        tokens = torch.tensor(gen_tokens, dtype=torch.long, device=self.device)
+        tokens = tokens[valid_indices][keep]
+
+        avg_policy_reward = float(np.mean(rewards))
+        avg_raw_objective = float(np.mean(learn_totals))
         self.monitor_ema = update_ema(
             self.monitor_ema, avg_raw_objective, self.monitor_ema_momentum
         )
 
-        gated_mask = gate_ok
-        if np.any(gated_mask):
-            mean_raw_ba_gated = float(np.mean(raw_bas[gated_mask]))
-            gated_valid_frac = float(np.mean(gated_mask))
+        if np.any(learn_gate):
+            mean_raw_ba_gated = float(np.mean(learn_bas[learn_gate]))
+            gated_valid_frac = float(np.mean(learn_gate))
         else:
             mean_raw_ba_gated = float("nan")
             gated_valid_frac = 0.0
-
-        gen_tokens_tensor = torch.tensor(gen_tokens, dtype=torch.long, device=self.device)
-        gen_tokens_tensor = gen_tokens_tensor[valid_indices]
-
-        log_probs, selected_log_probs, tok_mask = self._teacher_force_log_probs(
-            gen_tokens_tensor
-        )
 
         self.reward_baseline = (
             self.baseline_momentum * self.reward_baseline
             + (1 - self.baseline_momentum) * avg_policy_reward
         )
-        adjusted_rewards = torch.as_tensor(
-            policy_rewards - self.reward_baseline, dtype=torch.float32, device=self.device
+        advantages = torch.as_tensor(
+            rewards - self.reward_baseline, dtype=torch.float32, device=self.device
         )
+        total_items = max(int(tokens.shape[0]), 1)
+        total_tokens = float(self._pad_credit_mask(tokens[:, 1:]).sum().item())
+        total_tokens = max(total_tokens, 1.0)
 
-        entropy = self._masked_token_entropy(log_probs, tok_mask)
-        kl = self._kl_to_ref(log_probs, gen_tokens_tensor, tok_mask)
+        # Generation is microbatched; teacher-force must be too (full B≈256 OOMs on 8GB).
+        self.optimizer.zero_grad()
+        policy_loss_value = 0.0
+        kl_acc = 0.0
+        tether_m: dict = {}
+        for start in range(0, total_items, self.micro_batch_size):
+            end = min(start + self.micro_batch_size, total_items)
+            log_probs, selected_log_probs, tok_mask = self._teacher_force_log_probs(
+                tokens[start:end]
+            )
+            sequence_log_probs = (selected_log_probs * tok_mask).sum(dim=1)
+            token_entropy = -(torch.exp(log_probs) * log_probs).sum(dim=-1)
+            kl = self._kl_to_ref(log_probs, tokens[start:end], tok_mask)
+            micro_loss = -(
+                sequence_log_probs * advantages[start:end]
+            ).sum() / total_items
+            micro_loss = micro_loss - self.entropy_coef * (
+                (token_entropy * tok_mask).sum() / total_tokens
+            )
+            micro_loss = micro_loss + self.kl_coef * kl * (
+                float(end - start) / float(total_items)
+            )
+            tether_term, tether_m = self._chem_tether_term(
+                sequence_log_probs, learn_smiles[start:end]
+            )
+            # Scale tether like the policy term so microbatches sum to one batch loss.
+            micro_loss = micro_loss + tether_term * (
+                float(end - start) / float(total_items)
+            )
+            policy_loss_value += float(micro_loss.detach().item())
+            kl_acc += float(kl.detach().item()) * float(end - start)
+            if self.scaler is not None:
+                self.scaler.scale(micro_loss).backward()
+            else:
+                micro_loss.backward()
 
-        sequence_log_probs = (selected_log_probs * tok_mask).sum(dim=1)
-        policy_loss = (
-            -(sequence_log_probs * adjusted_rewards).mean()
-            - entropy * self.entropy_coef
-            + self.kl_coef * kl
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=self.grad_clip
         )
-        tether_term, tether_m = self._chem_tether_term(
-            sequence_log_probs, valid_smiles_list
-        )
-        policy_loss = policy_loss + tether_term
-
-        self._optimizer_step(policy_loss)
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
         out = {
-            "policy_loss": policy_loss.item(),
+            "policy_loss": policy_loss_value,
             "average_policy_reward": avg_policy_reward,
             "average_raw_objective": float(self.monitor_ema),
             "average_physchem_objective": float("nan"),
@@ -1341,23 +1758,200 @@ class RLPipeline:
             "gated_mean_reward": float("nan"),
             "gated_p90": float("nan"),
             "n_valid": n_valid,
-            "n_gated": int(np.sum(gate_ok)),
-            "n_learn": int(len(valid_indices)),
+            "n_gated": int(np.sum(learn_gate)),
+            "n_learn": int(len(keep)),
             "skipped_update": 0.0,
-            "max_policy_reward": float(np.max(policy_rewards)),
-            "min_policy_reward": float(np.min(policy_rewards)),
+            "max_policy_reward": float(np.max(rewards)),
+            "min_policy_reward": float(np.min(rewards)),
             "baseline": self.reward_baseline,
             "entropy_coef": self.entropy_coef,
             "temperature": self.current_temperature,
+            "scheduled_temperature": self.scheduled_temperature,
             "top_quantile": self.top_quantile,
+            "valid_frac": float(n_valid) / float(max(int(self.config.RL_TRAIN.BATCH_SIZE), 1)),
+            "unique_gated_frac": float(len(set(learn_smiles)) / max(len(learn_smiles), 1)),
+            "n_unique_gated": len(set(learn_smiles)),
+            "collapse_boost": 1.0 if self.collapse_boost_active else 0.0,
         }
         out.update(
             self._regularizer_metrics(
-                kl=float(kl.item()),
+                kl=float(kl_acc / total_items),
                 prior_fp_mean_factor=1.0,
                 **tether_m,
             )
         )
+        self._update_co2_health_ema(out)
+        self.last_unique_gated_frac = float(out["unique_gated_frac"])
+        return out
+
+    def _rl_step_surrogate(
+        self,
+        policy_rewards: np.ndarray,
+        predicted_ie: np.ndarray,
+        surrogate_uncertainty: np.ndarray,
+        mw_penalties: np.ndarray,
+        gen_tokens: list,
+        valid_indices: list[int],
+        valid_smiles_list: list[str],
+    ) -> dict:
+        """REINFORCE using only the surrogate IE reward plus entropy exploration."""
+        from objectives.co2_ie_surrogate import charged_atom_count, inorganic_atom_count
+
+        inorganic_counts = np.asarray(
+            [inorganic_atom_count(smi) for smi in valid_smiles_list],
+            dtype=np.float64,
+        )
+        charged_counts = np.asarray(
+            [charged_atom_count(smi) for smi in valid_smiles_list],
+            dtype=np.float64,
+        )
+        finite = np.isfinite(policy_rewards)
+        if not np.any(finite):
+            out = {
+                "policy_loss": 0.0,
+                "average_policy_reward": 0.0,
+                "average_raw_objective": float("nan"),
+                "average_physchem_objective": float("nan"),
+                "surrogate_uncertainty": float("nan"),
+                "gated_mean_reward": float("nan"),
+                "gated_p90": float("nan"),
+                "n_valid": len(valid_smiles_list),
+                "n_gated": 0,
+                "n_learn": 0,
+                "skipped_update": 1.0,
+                "baseline": self.reward_baseline,
+                "entropy_coef": self.entropy_coef,
+                "temperature": self.current_temperature,
+                "scheduled_temperature": self.scheduled_temperature,
+                "top_quantile": 1.0,
+                "valid_frac": 0.0,
+                "unique_gated_frac": 0.0,
+                "n_unique_gated": 0,
+                "inorganic_fraction": float(np.mean(inorganic_counts > 0))
+                if inorganic_counts.size
+                else 0.0,
+                "inorganic_atom_count_mean": float(np.mean(inorganic_counts))
+                if inorganic_counts.size
+                else 0.0,
+                "inorganic_penalty_mean": float(
+                    np.mean(inorganic_counts > 0) * self.inorganic_penalty
+                )
+                if inorganic_counts.size
+                else 0.0,
+                "charged_fraction": float(np.mean(charged_counts > 0))
+                if charged_counts.size
+                else 0.0,
+                "charged_atom_count_mean": float(np.mean(charged_counts))
+                if charged_counts.size
+                else 0.0,
+                "charged_penalty_mean": float(
+                    np.mean(charged_counts > 0) * self.charged_penalty
+                )
+                if charged_counts.size
+                else 0.0,
+                "mw_penalty_mean": float(np.nanmean(mw_penalties))
+                if np.any(np.isfinite(mw_penalties))
+                else 0.0,
+            }
+            out.update(self._regularizer_metrics(kl=0.0, kl_coef=0.0))
+            return out
+
+        keep = np.flatnonzero(finite)
+        rewards = policy_rewards[keep]
+        ie = predicted_ie[keep]
+        uncertainty = surrogate_uncertainty[keep]
+        tokens = torch.tensor(gen_tokens, dtype=torch.long, device=self.device)
+        tokens = tokens[valid_indices][keep]
+        learn_smiles = [valid_smiles_list[int(i)] for i in keep]
+        learn_inorganic_counts = inorganic_counts[keep]
+        learn_charged_counts = charged_counts[keep]
+        learn_mw_penalties = mw_penalties[keep]
+        mean_reward = float(np.mean(rewards))
+        self.reward_baseline = (
+            self.baseline_momentum * self.reward_baseline
+            + (1.0 - self.baseline_momentum) * mean_reward
+        )
+        advantages = torch.as_tensor(
+            rewards - self.reward_baseline, dtype=torch.float32, device=self.device
+        )
+        total_items = max(int(tokens.shape[0]), 1)
+        total_tokens = float(
+            self._pad_credit_mask(tokens[:, 1:]).sum().item()
+        )
+        total_tokens = max(total_tokens, 1.0)
+        self.optimizer.zero_grad()
+        policy_loss_value = 0.0
+        for start in range(0, total_items, self.micro_batch_size):
+            end = min(start + self.micro_batch_size, total_items)
+            log_probs, selected_log_probs, tok_mask = self._teacher_force_log_probs(
+                tokens[start:end]
+            )
+            sequence_log_probs = (selected_log_probs * tok_mask).sum(dim=1)
+            token_entropy = -(
+                torch.exp(log_probs) * log_probs
+            ).sum(dim=-1)
+            micro_loss = -(
+                sequence_log_probs * advantages[start:end]
+            ).sum() / total_items
+            micro_loss = micro_loss - self.entropy_coef * (
+                (token_entropy * tok_mask).sum() / total_tokens
+            )
+            policy_loss_value += float(micro_loss.detach().item())
+            if self.scaler is not None:
+                self.scaler.scale(micro_loss).backward()
+            else:
+                micro_loss.backward()
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=self.grad_clip
+        )
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+        self.monitor_ema = update_ema(
+            self.monitor_ema, mean_reward, self.monitor_ema_momentum
+        )
+        self.physchem_ema = update_ema(
+            self.physchem_ema, float(np.mean(ie)), self.monitor_ema_momentum
+        )
+        out = {
+            "policy_loss": policy_loss_value,
+            "average_policy_reward": mean_reward,
+            "average_raw_objective": float(self.monitor_ema),
+            "average_physchem_objective": float(self.physchem_ema),
+            "surrogate_uncertainty": float(np.nanmean(uncertainty)),
+            "gated_mean_reward": mean_reward,
+            "gated_p90": float(np.percentile(rewards, 90)),
+            "n_valid": len(valid_smiles_list),
+            "n_gated": int(len(keep)),
+            "n_learn": int(len(keep)),
+            "skipped_update": 0.0,
+            "max_policy_reward": float(np.max(rewards)),
+            "min_policy_reward": float(np.min(rewards)),
+            "baseline": self.reward_baseline,
+            "entropy_coef": self.entropy_coef,
+            "temperature": self.current_temperature,
+            "scheduled_temperature": self.scheduled_temperature,
+            "top_quantile": 1.0,
+            "valid_frac": 1.0,
+            "unique_gated_frac": float(len(set(learn_smiles)) / max(len(learn_smiles), 1)),
+            "n_unique_gated": len(set(learn_smiles)),
+            "inorganic_fraction": float(np.mean(learn_inorganic_counts > 0)),
+            "inorganic_atom_count_mean": float(np.mean(learn_inorganic_counts)),
+            "inorganic_penalty_mean": float(
+                np.mean(learn_inorganic_counts > 0) * self.inorganic_penalty
+            ),
+            "charged_fraction": float(np.mean(learn_charged_counts > 0)),
+            "charged_atom_count_mean": float(np.mean(learn_charged_counts)),
+            "charged_penalty_mean": float(
+                np.mean(learn_charged_counts > 0) * self.charged_penalty
+            ),
+            "mw_penalty_mean": float(np.mean(learn_mw_penalties)),
+        }
+        out.update(self._regularizer_metrics(kl=0.0, kl_coef=0.0))
         return out
 
     def _rl_step_co2(
@@ -1375,6 +1969,11 @@ class RLPipeline:
         *,
         n_valid: int,
     ) -> dict:
+        chem_bits: dict = {}
+        if _chem_objective():
+            from objectives.co2_chem_reward import component_means
+
+            chem_bits = component_means()
         gated_mask = gate_ok & np.isfinite(policy_rewards)
         n_gated = int(np.sum(gated_mask))
         gated_valid_frac = float(np.mean(gate_ok)) if gate_ok.size else 0.0
@@ -1463,6 +2062,7 @@ class RLPipeline:
                     else float("nan"),
                 )
             )
+            skip.update(chem_bits)
             self._update_co2_health_ema(skip)
             return skip
 
@@ -1508,25 +2108,49 @@ class RLPipeline:
                     else float("nan"),
                 )
             )
+            skip.update(chem_bits)
             self._update_co2_health_ema(skip)
             return skip
 
         unique_rewards = policy_rewards[unique_idx]
+        # FeOML: rank + advantages on raw −Δ‡ so elite replay (library tops)
+        # shares a scale with on-policy rewards (z-scored policy ≈ 0 is useless).
+        feoml = (
+            os.environ.get("MGW_OBJECTIVE", "").strip().lower() == "feoml_barrier"
+        )
+        if feoml:
+            unique_rewards = qualities[unique_idx]
         top_local = top_quantile_indices(unique_rewards, self.top_quantile)
         learn_idx = unique_idx[top_local]
-        learn_rewards = policy_rewards[learn_idx]
+        learn_rewards = (
+            qualities[learn_idx] if feoml else policy_rewards[learn_idx]
+        )
         learn_smiles = [valid_smiles_list[int(i)] for i in learn_idx]
 
+        if feoml and np.any(np.isfinite(qualities[gated_mask])):
+            gated_for_base = qualities[gated_mask]
+            baseline_signal = float(np.nanmean(gated_for_base))
+            batch_std = (
+                float(np.nanstd(gated_for_base)) if n_gated > 1 else 1.0
+            )
+        else:
+            baseline_signal = gated_mean
+            batch_std = float(np.std(gated_rewards)) if n_gated > 1 else 1.0
         self.reward_baseline = (
             self.baseline_momentum * self.reward_baseline
-            + (1 - self.baseline_momentum) * gated_mean
+            + (1 - self.baseline_momentum) * baseline_signal
         )
-        batch_std = float(np.std(gated_rewards)) if n_gated > 1 else 1.0
         self.reward_std_ema = update_ema(
             self.reward_std_ema, batch_std, self.baseline_momentum
         )
+        # Policy rewards are often batch-zscored (mean≈0). FeOML early-stop /
+        # best.pt must track raw −Δ‡, not the z-score mean.
+        if feoml and np.any(np.isfinite(raw_totals[gated_mask])):
+            monitor_signal = float(np.nanmean(raw_totals[gated_mask]))
+        else:
+            monitor_signal = gated_mean
         self.monitor_ema = update_ema(
-            self.monitor_ema, gated_mean, self.monitor_ema_momentum
+            self.monitor_ema, monitor_signal, self.monitor_ema_momentum
         )
         if math.isfinite(gated_physchem_mean):
             self.physchem_ema = update_ema(
@@ -1573,7 +2197,9 @@ class RLPipeline:
                     can = canonical_smiles_or_raw(smi)
                     if can in learn_canons:
                         continue
-                    tok = tokenize(smi, max_len=max(max_len, tgt_len))
+                    tok = tokenize_from_smiles(smi, max_len=max(max_len, tgt_len))
+                    if tok is None:
+                        continue
                     if len(tok) < tgt_len:
                         tok = tok + [stoi[pad_token]] * (tgt_len - len(tok))
                     elite_rows.append(tok[:tgt_len])
@@ -1644,6 +2270,7 @@ class RLPipeline:
             "scheduled_temperature": self.scheduled_temperature,
             "top_quantile": self.top_quantile,
         }
+        out.update(chem_bits)
         out.update(monitor)
         out.update(
             self._regularizer_metrics(
@@ -1734,8 +2361,9 @@ class RLPipeline:
                 cuda_states = None
 
         set_seed(int(self.config.RANDOM_SEED) + 10_000)
-        smiles_list, _, _ = self.generate_molecules(
+        smiles_list, _, _ = self.generate_molecules_batched(
             batch_size=self.eval_batch_size,
+            micro_batch_size=self.micro_batch_size,
             temperature=self.temperature_end,
         )
         valid = [s for s in smiles_list if valid_smiles(s)]
@@ -2096,12 +2724,21 @@ _RL_METRIC_KEYS = (
     "gated_mean_reward",
     "average_raw_objective",
     "average_physchem_objective",
+    "surrogate_uncertainty",
+    "inorganic_fraction",
+    "inorganic_atom_count_mean",
+    "inorganic_penalty_mean",
+    "charged_fraction",
+    "charged_atom_count_mean",
+    "charged_penalty_mean",
+    "mw_penalty_mean",
     "gated_valid_frac",
     "valid_frac",
     "valid_frac_ema",
     "unique_gated_frac",
     "unique_gated_frac_ema",
     "n_unique_gated",
+    "collapse_boost",
     "n_valid",
     "n_gated",
     "n_learn",
@@ -2126,6 +2763,11 @@ _RL_METRIC_KEYS = (
     "scheduled_temperature",
     "temperature",
     "top_quantile",
+    "chem_s_nuc",
+    "chem_s_open",
+    "chem_s_stab",
+    "chem_s_attack",
+    "chem_diversity",
 )
 
 

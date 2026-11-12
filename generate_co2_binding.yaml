@@ -1,0 +1,31 @@
+# Full proposal generation for Bayesian AL handoff.
+DEVICE: auto
+RANDOM_SEED: 2026
+RUN_NAME: co2_binding_proposals
+
+OUTPUTS:
+  DIR: ./artifacts/discovery
+
+MODEL:
+  N_LAYERS: 12
+  N_HEADS: 12
+  N_EMBD: 384
+  MAX_LEN: 128
+  NUM_PROPS: 0
+  EMBD_PDROP: 0.1
+  RESID_PDROP: 0.1
+  ATTN_PDROP: 0.1
+  VOCAB_SIZE: 103
+  REPRESENTATION: selfies
+  VOCAB_PATH: data/mixed_selfies/vocab.json
+
+GENERATE:
+  CONTEXT: '[C]'
+  BATCH_SIZE: 64
+  N_CPU: 4
+  VERSION: nc
+  TEMPERATURE: 1.0
+  TEMPLATES: ['']
+  CKPT_PATH: weights/guacamol_nc_selfies_medium_co2.pt
+  OUTPUT: artifacts/discovery/raw_smiles.csv
+  N_REPEAT: 160
