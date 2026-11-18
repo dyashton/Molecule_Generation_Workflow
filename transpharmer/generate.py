@@ -7,7 +7,7 @@ import os
 import numpy.core.multiarray as multiarray
 
 from transpharmer.model import GPT, sample
-from transpharmer.dataset import tokenize, untokenize
+from transpharmer.dataset import configure_from_config, tokenize, tokens_to_smiles, untokenize
 from transpharmer.utils.seed import set_seed
 from transpharmer.utils.io import load_config
 from transpharmer.utils.mol import get_props_from_mols
@@ -20,6 +20,12 @@ def batchify_a_list(list_, size):
 
 
 def generate_yield(input_config):
+    # Resolve DEVICE: auto (YAML default for HPC smoke/full generate).
+    requested = str(getattr(input_config, "DEVICE", "cpu")).strip().lower()
+    if requested == "auto":
+        input_config.DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    configure_from_config(input_config)
+
     model = GPT(input_config)
     
     # Load model weights with proper device mapping
@@ -89,7 +95,7 @@ def generate_yield(input_config):
             gen_tokens = sample(model=model, x=context, steps=input_config.MODEL.MAX_LEN,
                                 temperature=input_config.GENERATE.TEMPERATURE, sample_=True, top_k=None, prop=prop)
             gen_tokens = gen_tokens.cpu().numpy().tolist()
-            gen_smiles = mapper(untokenize, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
+            gen_smiles = mapper(tokens_to_smiles, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
 
             lines = [f"{t_},{raw_smi}\n" for t_, raw_smi in zip(templates, gen_smiles)]
             with open(input_config.GENERATE.OUTPUT, "a") as fo:
@@ -107,7 +113,7 @@ def generate_yield(input_config):
             gen_tokens = sample(model=model, x=context, steps=input_config.MODEL.MAX_LEN,
                                 temperature=input_config.GENERATE.TEMPERATURE, sample_=True, top_k=None, prop=None)
             gen_tokens = gen_tokens.cpu().numpy().tolist()
-            gen_smiles = mapper(untokenize, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
+            gen_smiles = mapper(tokens_to_smiles, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
 
             lines = [f"{raw_smi}\n" for raw_smi in gen_smiles]
             with open(input_config.GENERATE.OUTPUT, "a") as fo:
@@ -120,6 +126,11 @@ def generate_yield(input_config):
 
 
 def generate(input_config):
+    requested = str(getattr(input_config, "DEVICE", "cpu")).strip().lower()
+    if requested == "auto":
+        input_config.DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    configure_from_config(input_config)
+
     model = GPT(input_config)
     
     # Load model weights with proper device mapping
@@ -200,7 +211,7 @@ def generate(input_config):
             gen_tokens = sample(model=model, x=context, steps=input_config.MODEL.MAX_LEN,
                                 temperature=input_config.GENERATE.TEMPERATURE, sample_=True, top_k=None, prop=prop)
             gen_tokens = gen_tokens.cpu().numpy().tolist()
-            gen_smiles = mapper(untokenize, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
+            gen_smiles = mapper(tokens_to_smiles, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
 
             lines = [f"{t_},{raw_smi}\n" for t_, raw_smi in zip(templates, gen_smiles)]
             with open(input_config.GENERATE.OUTPUT, "a") as fo:
@@ -217,7 +228,7 @@ def generate(input_config):
             gen_tokens = sample(model=model, x=context, steps=input_config.MODEL.MAX_LEN,
                                 temperature=input_config.GENERATE.TEMPERATURE, sample_=True, top_k=None, prop=None)
             gen_tokens = gen_tokens.cpu().numpy().tolist()
-            gen_smiles = mapper(untokenize, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
+            gen_smiles = mapper(tokens_to_smiles, gen_tokens, max_n_cpu=input_config.GENERATE.N_CPU, verbose=False)
 
             lines = [f"{raw_smi}\n" for raw_smi in gen_smiles]
             with open(input_config.GENERATE.OUTPUT, "a") as fo:

@@ -1,4 +1,7 @@
+import json
 import re
+from pathlib import Path
+
 import numpy as np
 from rdkit import Chem
 import torch
@@ -9,28 +12,125 @@ from transpharmer.utils.pharm.misc import get_pharma_fp, get_pharma_count_fp
 
 pad_token = '<'
 nan_token = ''
-tokens = ['#', '%10', '%11', '%12', '(', ')', '-', '1', '2', '3', '4', '5', '6', '7', '8', '9', pad_token, '=', 'B', 'Br', 'C', 'Cl', 'F', 'I', 'N', 'O', 'P', 'S', '[B-]', '[BH-]', '[BH2-]', '[BH3-]', '[B]', '[C+]', '[C-]', '[CH+]', '[CH-]', '[CH2+]', '[CH2]', '[CH]', '[F+]', '[H]', '[I+]', '[IH2]', '[IH]', '[N+]', '[N-]', '[NH+]', '[NH-]', '[NH2+]', '[NH3+]',
-          '[N]', '[O+]', '[O-]', '[OH+]', '[O]', '[P+]', '[PH+]', '[PH2+]', '[PH]', '[S+]', '[S-]', '[SH+]', '[SH]', '[Se+]', '[SeH+]', '[SeH]', '[Se]', '[Si-]', '[SiH-]', '[SiH2]', '[SiH]', '[Si]', '[b-]', '[bH-]', '[c+]', '[c-]', '[cH+]', '[cH-]', '[n+]', '[n-]', '[nH+]', '[nH]', '[o+]', '[s+]', '[sH+]', '[se+]', '[se]', 'b', 'c', 'n', 'o', 'p', 's']
+_DEFAULT_SMILES_TOKENS = [
+    '#', '%10', '%11', '%12', '(', ')', '-', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    pad_token, '=', 'B', 'Br', 'C', 'Cl', 'F', 'I', 'N', 'O', 'P', 'S', '[B-]', '[BH-]',
+    '[BH2-]', '[BH3-]', '[B]', '[C+]', '[C-]', '[CH+]', '[CH-]', '[CH2+]', '[CH2]', '[CH]',
+    '[F+]', '[H]', '[I+]', '[IH2]', '[IH]', '[N+]', '[N-]', '[NH+]', '[NH-]', '[NH2+]',
+    '[NH3+]', '[N]', '[O+]', '[O-]', '[OH+]', '[O]', '[P+]', '[PH+]', '[PH2+]', '[PH]',
+    '[S+]', '[S-]', '[SH+]', '[SH]', '[Se+]', '[SeH+]', '[SeH]', '[Se]', '[Si-]', '[SiH-]',
+    '[SiH2]', '[SiH]', '[Si]', '[b-]', '[bH-]', '[c+]', '[c-]', '[cH+]', '[cH-]', '[n+]',
+    '[n-]', '[nH+]', '[nH]', '[o+]', '[s+]', '[sH+]', '[se+]', '[se]', 'b', 'c', 'n', 'o',
+    'p', 's',
+]
+tokens = list(_DEFAULT_SMILES_TOKENS)
 vocab_size = len(tokens)
 stoi = {ch: i for i, ch in enumerate(tokens)}
 itos = {i: ch for i, ch in enumerate(tokens)}
 
-pattern = "(\[[^\]]+]|<|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+_SMILES_PATTERN = (
+    "(\[[^\]]+]|<|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\\(|\\)|\\.|=|#|-|\\+|\\\\|\\/|:|~|@|\\?|>|"
+    "\\*|\\$|\\%[0-9]{2}|[0-9])"
+)
+_SELFIES_PATTERN = r"(\[[^\]]+\]|<)"
+pattern = _SMILES_PATTERN
 regex = re.compile(pattern)
+_REPRESENTATION = "smiles"
+
+
+def _resolve_vocab_path(raw: str | Path) -> Path:
+    path = Path(raw)
+    if path.is_file():
+        return path.resolve()
+    cwd_hit = (Path.cwd() / path).resolve()
+    if cwd_hit.is_file():
+        return cwd_hit
+    root_hit = (Path(__file__).resolve().parents[1] / path).resolve()
+    if root_hit.is_file():
+        return root_hit
+    raise FileNotFoundError(f"VOCAB_PATH not found: {raw}")
+
+
+def configure_from_config(config) -> None:
+    """Load MODEL.VOCAB_PATH / REPRESENTATION into module-level stoi/itos (in-place)."""
+    global vocab_size, pattern, regex, _REPRESENTATION, pad_token
+
+    model = getattr(config, "MODEL", config)
+    rep = str(getattr(model, "REPRESENTATION", "smiles") or "smiles").strip().lower()
+    vocab_path = getattr(model, "VOCAB_PATH", None)
+
+    if vocab_path:
+        data = json.loads(_resolve_vocab_path(vocab_path).read_text())
+        new_tokens = list(data["tokens"])
+        pad_token = str(data.get("pad_token", "<"))
+        rep = str(data.get("representation", rep) or rep).strip().lower()
+    else:
+        new_tokens = list(_DEFAULT_SMILES_TOKENS)
+        pad_token = "<"
+
+    tokens[:] = new_tokens
+    stoi.clear()
+    stoi.update({ch: i for i, ch in enumerate(tokens)})
+    itos.clear()
+    itos.update({i: ch for i, ch in enumerate(tokens)})
+    vocab_size = len(tokens)
+    _REPRESENTATION = rep
+    pattern = _SELFIES_PATTERN if _REPRESENTATION == "selfies" else _SMILES_PATTERN
+    regex = re.compile(pattern)
+
+    expected = getattr(model, "VOCAB_SIZE", None)
+    if expected is not None and int(expected) != vocab_size:
+        raise ValueError(
+            f"MODEL.VOCAB_SIZE={expected} does not match loaded vocab ({vocab_size})"
+        )
 
 
 def tokenize(smiles, max_len=0):
-    tokens = [stoi[s] for s in regex.findall(smiles)]
+    ids = [stoi[s] for s in regex.findall(smiles)]
     if max_len > 0:
-        tokens += [stoi[pad_token]]*(max_len-len(tokens))
-        tokens = tokens[:max_len]
-    return tokens
+        ids += [stoi[pad_token]] * (max_len - len(ids))
+        ids = ids[:max_len]
+    return ids
 
 
-def untokenize(tokens):
-    smiles = ''.join([itos[int(t)] for t in tokens])
-    smiles = smiles.replace(pad_token, nan_token)
-    return smiles
+def untokenize(token_ids):
+    text = "".join([itos[int(t)] for t in token_ids])
+    return text.replace(pad_token, nan_token)
+
+
+def tokenize_from_smiles(smiles: str, max_len: int = 0):
+    """SMILES → token ids (encodes to SELFIES when representation=selfies)."""
+    if smiles is None:
+        return None
+    text = str(smiles).strip()
+    if not text:
+        return None
+    if _REPRESENTATION == "selfies":
+        import selfies as sf
+
+        try:
+            text = sf.encoder(text)
+        except Exception:
+            return None
+    try:
+        return tokenize(text, max_len=max_len)
+    except KeyError:
+        return None
+
+
+def tokens_to_smiles(token_ids) -> str:
+    """Token ids → SMILES (decodes SELFIES when representation=selfies)."""
+    raw = untokenize(token_ids)
+    if not raw:
+        return ""
+    if _REPRESENTATION == "selfies":
+        import selfies as sf
+
+        try:
+            return str(sf.decoder(raw))
+        except Exception:
+            return ""
+    return raw
 
 
 class SmileDataset(Dataset):

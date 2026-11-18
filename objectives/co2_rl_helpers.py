@@ -345,6 +345,11 @@ def mw_excess(
     return (x - ihi) / denom if denom > 0.0 else float("inf")
 
 
+def mw_penalty_excess(mw: float) -> float:
+    """Default MW excess for binding-surrogate additive penalty (weight applied by caller)."""
+    return mw_excess(float(mw))
+
+
 # RDKit rotatable-bond SMARTS (same class as CalcNumRotatableBonds / Lipinski).
 _ROTATABLE_BOND_SMARTS = None
 _OH_SMARTS = None

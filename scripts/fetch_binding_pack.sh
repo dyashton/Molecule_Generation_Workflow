@@ -67,5 +67,7 @@ else
   exit 1
 fi
 
+# Always rewrite from MGW root (callers may invoke this script from a sibling cwd).
+cd "$ROOT"
 uv run python scripts/rewrite_binding_pack_paths.py --dest "$DEST"
 ls -lh "$DEST"

@@ -24,7 +24,6 @@ from objectives.co2_reward import CO2ObjectiveScorer
 from objectives.diversity import tanimoto_diversity_scores
 from objectives.druglike_reward import get_druglike_scorer
 from objectives.unbounded_proxy_reward import get_unbounded_proxy_scorer
-from objectives.feoml_barrier_reward import get_feoml_objective_scorer
 from objectives.filters import FilterConfig, passes_filters
 from objectives.prior_fp_tether import PriorFPTether, load_smiles_cache
 from objectives.shape_exclusion import ShapeExclusionScreener
@@ -311,6 +310,9 @@ def compute_reward_batch(smiles_list: list[str]) -> RewardBatch:
 
     if _objective_name() == "feoml_barrier":
         # Slot map: raw_total=quality=−barrier; raw_ba=barrier; raw_physchem=spin_code.
+        # ponytail: module not shipped on co2-binding-hpc; lazy so other objectives import
+        from objectives.feoml_barrier_reward import get_feoml_objective_scorer
+
         batch = get_feoml_objective_scorer().compute_batch(smiles_list)
         return RewardBatch(
             policy=batch.policy,
